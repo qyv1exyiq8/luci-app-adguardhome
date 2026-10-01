@@ -1,0 +1,131 @@
+<%+cbi/valueheader%>
+<div class="cbi-value-field">
+    <input class="cbi-button cbi-button-apply" type="button" value="<%:检查更新%>" 
+        onclick="startUpdateProcess()" id="upgrade-btn" />
+    <span id="status-message" class="status-message"></span>
+</div>
+<script type="text/javascript">
+(function() {
+    const elements = {
+        btn: document.getElementById('upgrade-btn'),
+        status: document.getElementById('status-message')
+    };
+    let statusInterval = null;
+
+    const updateUI = (state) => {
+        elements.btn.disabled = state.disabled || false;
+        if (state.text) elements.btn.value = state.text;
+        if (state.status) {
+            elements.status.textContent = state.status;
+            elements.status.style.color = state.error ? '#d44' : '#4a4';
+        }
+    };
+
+    const checkStatus = async (retries = 0) => {
+        try {
+            const res = await fetch('<%=url("admin/system/autoupdate/check_status")%>');
+            const data = await res.json();
+            
+            if (data.running || data.is_upgrading) {
+                updateUI({ 
+                    disabled: true,
+                    text: '升级中...',
+                    status: data.message || '升级进行中' 
+                });
+            } else {
+                clearInterval(statusInterval);
+                updateUI({
+                    disabled: false,
+                    text: '<%:检查更新%>',
+                    status: data.message || (data.success ? '升级成功' : '升级失败'),
+                    error: !data.success
+                });
+            }
+        } catch (e) {
+            if (retries < 3) {
+                setTimeout(() => checkStatus(retries + 1), 1000);
+            } else {
+                clearInterval(statusInterval);
+                updateUI({
+                    disabled: false,
+                    text: '<%:检查更新%>',
+                    status: '状态检查失败,或已升级成功,请刷新页面查看',
+                    error: true
+                });
+            }
+        }
+    };
+
+    window.startUpdateProcess = async () => {
+        // Immediately disable button to prevent multiple clicks
+        updateUI({
+            disabled: true,
+            text: '处理中...',
+            status: '正在处理请求...'
+        });
+
+        try {
+            // First check if upgrade is already running
+            const statusRes = await fetch('<%=url("admin/system/autoupdate/check_status")%>');
+            const statusData = await statusRes.json();
+            
+            if (statusData.is_upgrading || statusData.running) {
+                updateUI({
+                    disabled: true,
+                    text: '升级中...',
+                    status: '系统正在升级中，请稍候...'
+                });
+                statusInterval = setInterval(checkStatus, 3000);
+                return;
+            }
+
+            // Proceed with normal check
+            const res = await fetch('<%=url("admin/system/autoupdate/do_check")%>', { 
+                method: 'POST' 
+            });
+            const data = await res.json();
+            
+            if (data.is_upgrading) {
+                updateUI({
+                    disabled: true,
+                    text: '升级中...',
+                    status: '系统正在升级中，请稍候...'
+                });
+                statusInterval = setInterval(checkStatus, 3000);
+                return;
+            }
+
+            if (!data.success) throw new Error(data.message);
+            if (data.has_update && confirm(data.message)) {
+                const upgradeRes = await fetch('<%=url("admin/system/autoupdate/do_upgrade")%>', { 
+                    method: 'POST' 
+                });
+                const upgradeData = await upgradeRes.json();
+                
+                if (!upgradeData.success) throw new Error(upgradeData.message);
+                
+                updateUI({
+                    disabled: true,
+                    text: '升级中...',
+                    status: upgradeData.message || '后台升级已启动'
+                });
+                statusInterval = setInterval(checkStatus, 3000);
+            } else {
+                updateUI({
+                    disabled: false,
+                    text: '<%:检查更新%>',
+                    status: data.message
+                });
+            }
+        } catch (e) {
+            updateUI({
+                disabled: false,
+                text: '<%:检查更新%>',
+                status: e.message || '操作失败,请查看日志',
+                error: true
+            });
+        }
+    };
+})();
+</script>
+<%+cbi/valuefooter%>

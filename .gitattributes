@@ -1,0 +1,7 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+# CI 在 Linux 上克隆并直接执行/解析这些文件,强制 LF 防止 Windows 端提交 CRLF
+*.sh text eol=lf
+Makefile text eol=lf
+*.json text eol=lf
+*.js text eol=lf

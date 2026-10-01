@@ -1,0 +1,70 @@
+<%+cbi/valueheader%>
+<div class="cbi-value-field">
+    <div id="autoupdate-log-box" style="width:100%;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+            <span id="autoupdate-log-indicator" style="color:#666;font-size:12px;">自动刷新中 (1秒/次)</span>
+            <span id="autoupdate-log-time" style="color:#999;font-size:12px;"></span>
+        </div>
+        <pre id="autoupdate-log-content" style="
+            width:100%;
+            max-height:320px;
+            overflow-y:auto;
+            background:#1e1e1e;
+            color:#dcdcdc;
+            padding:10px 12px;
+            border-radius:4px;
+            border:1px solid #333;
+            font-family:'Courier New',Consolas,monospace;
+            font-size:12px;
+            line-height:1.6;
+            white-space:pre-wrap;
+            word-break:break-all;
+            margin:0;
+        ">加载中...</pre>
+    </div>
+</div>
+<script type="text/javascript">
+(function() {
+    var logEl   = document.getElementById('autoupdate-log-content');
+    var indEl   = document.getElementById('autoupdate-log-indicator');
+    var timeEl  = document.getElementById('autoupdate-log-time');
+    var autoScroll = true;
+
+    logEl.addEventListener('scroll', function() {
+        autoScroll = (logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 30;
+    });
+
+    function fetchLog() {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', '<%=url("admin/system/autoupdate/log")%>', true);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState === 4) {
+                if (xhr.status === 200) {
+                    try {
+                        var data = JSON.parse(xhr.responseText);
+                        logEl.textContent = (data.log && data.log.length > 0) ? data.log : '(日志为空)';
+                        if (autoScroll) {
+                            logEl.scrollTop = logEl.scrollHeight;
+                        }
+                        indEl.textContent = '自动刷新中 (1秒/次)';
+                        indEl.style.color = '#666';
+                        var now = new Date();
+                        timeEl.textContent = now.toLocaleTimeString();
+                    } catch (e) {
+                        indEl.textContent = '解析失败: ' + e.message;
+                        indEl.style.color = '#d44';
+                    }
+                } else {
+                    indEl.textContent = '请求失败 (HTTP ' + xhr.status + ')';
+                    indEl.style.color = '#d44';
+                }
+            }
+        };
+        xhr.send();
+    }
+
+    fetchLog();
+    setInterval(fetchLog, 1000);
+})();
+</script>
+<%+cbi/valuefooter%>

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Open-Box 首次开机初始化(与 scripts/install.sh 收尾动作一致):
+# 只启用面板自启,不启用内核——内核等面板里配好订阅/分流后再启动。
+# LuCI 菜单/ACL 文件已在固件里,首启 rpcd 自然加载,无需重启 rpcd。
+
+/etc/init.d/openbox-panel enable
+
+exit 0

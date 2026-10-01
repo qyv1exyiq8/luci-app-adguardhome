@@ -1,0 +1,80 @@
+#!/bin/sh /etc/rc.common
+START=99
+
+generate_openwrt_update() {
+    local github_link=$(uci -q get autoupdate.@login[0].github)
+    local github_proxy=$(uci -q get autoupdate.@login[0].github_proxy)
+    local release_download=$(uci -q get autoupdate.@login[0].release_download)
+    local source=$(uci -q get autoupdate.@login[0].source)
+    local luci_edition=$(uci -q get autoupdate.@login[0].luci_edition)
+    local firmware_version=$(uci -q get autoupdate.@login[0].firmware_version)
+    local target_board=$(uci -q get autoupdate.@login[0].target_board)
+    local device_model=$(uci -q get autoupdate.@login[0].device_model)
+    local firmware_suffix=$(uci -q get autoupdate.@login[0].firmware_suffix)
+
+    if [ -n "$github_link" ]; then
+        cat > /etc/openwrt_update << EOF
+GITHUB_LINK="${github_link}"
+GITHUB_PROXY="${github_proxy:-https://ghproxy.com}"
+RELEASE_DOWNLOAD="${release_download:-releases/download}"
+SOURCE="${source:-openwrt}"
+LUCI_EDITION="${luci_edition:-luci}"
+FIRMWARE_VERSION="${firmware_version:-1.0.0}"
+TARGET_BOARD="${target_board:-x86}"
+DEVICE_MODEL="${device_model:-generic}"
+FIRMWARE_SUFFIX="${firmware_suffix:-.img.gz}"
+EOF
+        chmod 755 /etc/openwrt_update
+    fi
+}
+
+run_autoupdate() {
+    local config_section="$1"
+    local enable
+    local use_no_config_update
+    local minute
+    local hour
+    local week
+    local update_command
+    local luci_url
+    local update_url_file_content
+    local current_update_url
+
+    enable=$(uci get "autoupdate.$config_section.enable")
+    use_no_config_update=$(uci get "autoupdate.$config_section.use_no_config_update")
+
+    if [ "$enable" == "1" ]; then
+        week=$(uci get "autoupdate.$config_section.week")
+        [ "$week" == "7" ] && week="*"
+        minute=$(uci get "autoupdate.$config_section.minute")
+        hour=$(uci get "autoupdate.$config_section.hour")
+
+        crontab -l | grep -v AutoUpdate | crontab -
+
+        if [ "$use_no_config_update" == "1" ]; then
+            update_command="AutoUpdate -k"
+        else
+            update_command="AutoUpdate -u"
+        fi
+
+        (crontab -l 2>/dev/null; echo "$minute $hour * * $week $update_command") | crontab -
+        /etc/init.d/cron restart
+    fi
+
+    generate_openwrt_update
+}
+
+start() {
+    config_load autoupdate
+    config_foreach run_autoupdate login
+}
+
+stop() {
+    crontab -l | grep -v AutoUpdate | crontab -
+    /etc/init.d/cron restart
+}
+
+restart() {
+    stop
+    start
+}

@@ -1,0 +1,27 @@
+#!/bin/sh
+
+uci -q batch <<-EOF >/dev/null
+	delete ucitrack.@autoupdate[-1]
+	add ucitrack autoupdate
+	set ucitrack.@autoupdate[-1].init=autoupdate
+	commit ucitrack
+EOF
+
+rm -rf /tmp/luci-*
+
+if [ ! -f /etc/openwrt_update ]; then
+	cat > /etc/openwrt_update << 'EOF'
+GITHUB_LINK="https://github.com/yourusername/your-repo"
+GITHUB_PROXY="https://ghproxy.com"
+RELEASE_DOWNLOAD="releases/download"
+SOURCE="openwrt"
+LUCI_EDITION="luci"
+FIRMWARE_VERSION="1.0.0"
+TARGET_BOARD="x86"
+DEVICE_MODEL="generic"
+FIRMWARE_SUFFIX=".img.gz"
+EOF
+	chmod 755 /etc/openwrt_update
+fi
+
+exit 0
