@@ -1,0 +1,240 @@
+#!/bin/sh
+# Open-Box sing-box 内核服务控制脚本（iKuai 定制版）
+# 上半部分（pre_start / post_stop 及全部 openbox_* 函数）与官方 debian/bin/openbox-ctl 完全一致；
+# 底部动作分发把 systemctl 调用换成本地进程管理：
+#   start  -> 置 data/.core-enabled，后台拉起 ikuai/core-supervisor.sh 守护循环（等效 systemctl start）
+#   stop   -> 撤 enabled 标志、停守护循环与内核（等效 systemctl stop）
+#   status -> 面板判断"在跑"只看输出里有没有 running，与官方语义一致
+#   enable/disable/enabled -> iKuai 无 systemd，自举由 crond 看门狗负责，这里仅返回成功
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+UNIT=openbox.service
+OPENBOX_ROOT=/opt/open-box
+BIN="$OPENBOX_ROOT/bin/sing-box"
+CONF="$OPENBOX_ROOT/etc/config.json"
+DATA="$OPENBOX_ROOT/data"
+# sing-box 自己流量的 fwmark(tun 的 auto_redirect_output_mark 默认值),见 OpenWrt 脚本
+SINGBOX_OUTPUT_MARK=0x2024
+# Open-Box 的放行位(内核 tcp15 起认):进内核前放行的流量只按位或上这一位,交给系统自己的路由,见 OpenWrt 脚本
+OPENBOX_PASS_MARK=0x02000000
+NFT_TABLE="inet openbox"
+OPENBOX_MARK_RULE_PREF=8999
+OPENBOX_PASS_RULE_PREF=8998
+OPENBOX_PASS_SKIP_TO=9010
+OPENBOX_PASS_LAST_PREF=32767
+# 起内核前 ip_forward 的原值:是我们打开的才在停止时关回去,用户本来就开着的不动
+FORWARD_STATE="$DATA/ip-forward.prev"
+
+# iKuai 专有：守护循环与启用标志
+SUP="$OPENBOX_ROOT/ikuai/core-supervisor.sh"
+SUP_PIDFILE="$DATA/core-supervisor.pid"
+ENABLED_FLAG="$DATA/.core-enabled"
+
+# 进内核之前就放行的端口 / 终端(GitHub #183 #187):面板部署时生成的 nft 链正文(不含 table 外壳,
+# server/system/entry-bypass.mjs)。只认规则里会出现的字符,混进别的东西整份不装
+ENTRY_BYPASS="$OPENBOX_ROOT/etc/entry-bypass.nft"
+openbox_entry_bypass() {
+	[ -s "$ENTRY_BYPASS" ] || return 0
+	grep -q '[^A-Za-z0-9 	{}.,:;!="_@/-]' "$ENTRY_BYPASS" && return 0
+	cat "$ENTRY_BYPASS"
+}
+
+# Open-Box 自己的 nft 表(inet openbox),起内核前按需整张重建;都不需要就不建。
+# Debian 上没有 dnsmasq 分流,表里只有面板生成的进内核前放行链
+openbox_apply_nft() {
+	command -v nft >/dev/null 2>&1 || return 0
+	nft delete table $NFT_TABLE >/dev/null 2>&1
+	_ob_entry="$(openbox_entry_bypass)"
+	[ -n "$_ob_entry" ] || return 0
+	{
+		echo "table $NFT_TABLE {"
+		echo "$_ob_entry"
+		echo "}"
+	} | nft -f - >/dev/null 2>&1 || echo "openbox: failed to install nft table $NFT_TABLE" >&2
+}
+
+# auto_redirect 在 nft 里用到的表达式各自是一个内核模块(queue / nat / redir / tproxy / socket / fib),
+# 重启后没人加载它们,nft 提交规则时内核找不到模块就回 ENOENT(GitHub #225)。起内核前挨个 modprobe 一遍
+openbox_load_modules() {
+	for _ob_mod in tun nft_queue nft_nat nft_redir nft_tproxy nft_socket nft_fib_inet nft_ct; do
+		[ -d "/sys/module/$_ob_mod" ] || modprobe "$_ob_mod" >/dev/null 2>&1
+	done
+}
+
+# 内核的 auto_redirect 会自己建一张 inet sing-box 表,被强杀 / OOM 时不会删,下次启动撞上就 FATAL(file exist)。
+# 只在没有任何 sing-box 在跑时才清:机器上要是还跑着别的 sing-box,那张表是它的
+# 注意:iKuai 的 BusyBox 1.23 里 pgrep -x 按完整命令行比较,永远匹配不上 comm 名,
+# 全脚本统一用 pgrep -f 'bin/sing-box run' 判进程
+openbox_clean_stale_nft() {
+	command -v nft >/dev/null 2>&1 || return 0
+	pgrep -f 'bin/sing-box run' >/dev/null 2>&1 && return 0
+	nft list table inet sing-box >/dev/null 2>&1 || return 0
+	echo "openbox: removing stale nftables table left by a previous kernel run" >&2
+	nft delete table inet sing-box >/dev/null 2>&1
+	return 0
+}
+
+# 给内核自身流量的标记补一条终止查找的策略路由(GitHub #157),再给放行位补两条不进 tun 表的,说明见 OpenWrt 脚本
+openbox_apply_mark_rule() {
+	command -v ip >/dev/null 2>&1 || return 0
+	openbox_clear_mark_rule
+	ip rule add pref $OPENBOX_MARK_RULE_PREF fwmark $SINGBOX_OUTPUT_MARK lookup main >/dev/null 2>&1
+	ip -6 rule add pref $OPENBOX_MARK_RULE_PREF fwmark $SINGBOX_OUTPUT_MARK lookup main >/dev/null 2>&1
+	for _ob_ip in "ip" "ip -6"; do
+		$_ob_ip rule add pref $OPENBOX_PASS_RULE_PREF fwmark $OPENBOX_PASS_MARK/$OPENBOX_PASS_MARK goto $OPENBOX_PASS_SKIP_TO >/dev/null 2>&1
+		$_ob_ip rule add pref $OPENBOX_PASS_LAST_PREF fwmark $OPENBOX_PASS_MARK/$OPENBOX_PASS_MARK unreachable >/dev/null 2>&1
+	done
+	return 0
+}
+
+openbox_clear_mark_rule() {
+	command -v ip >/dev/null 2>&1 || return 0
+	while ip rule del pref $OPENBOX_MARK_RULE_PREF >/dev/null 2>&1; do :; done
+	while ip -6 rule del pref $OPENBOX_MARK_RULE_PREF >/dev/null 2>&1; do :; done
+	# 32767 上还有系统自己的 lookup default:只按放行位那条的条件删,不能光按优先级删
+	for _ob_ip in "ip" "ip -6"; do
+		while $_ob_ip rule del pref $OPENBOX_PASS_RULE_PREF fwmark $OPENBOX_PASS_MARK/$OPENBOX_PASS_MARK >/dev/null 2>&1; do :; done
+		while $_ob_ip rule del pref $OPENBOX_PASS_LAST_PREF fwmark $OPENBOX_PASS_MARK/$OPENBOX_PASS_MARK unreachable >/dev/null 2>&1; do :; done
+	done
+	return 0
+}
+
+# 旁路由用法要靠这台机器转发局域网终端的包(OpenWrt 作为路由器本来就开着);Debian 桌面 / 服务器默认是关的。
+# 记下原值,停止时是我们开的才关回去
+openbox_enable_forward() {
+	_ob_v4="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)"
+	if [ "$_ob_v4" = "0" ]; then
+		mkdir -p "$DATA"
+		printf 'ipv4=0\n' > "$FORWARD_STATE"
+		sysctl -q -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+	fi
+	# 配置里 tun 带 IPv6 地址才需要 v6 转发
+	if grep -q '"inet6_address"' "$CONF" 2>/dev/null; then
+		_ob_v6="$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)"
+		if [ "$_ob_v6" = "0" ]; then
+			mkdir -p "$DATA"
+			printf 'ipv6=0\n' >> "$FORWARD_STATE"
+			sysctl -q -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+		fi
+	fi
+	return 0
+}
+
+openbox_restore_forward() {
+	[ -f "$FORWARD_STATE" ] || return 0
+	grep -q '^ipv4=0' "$FORWARD_STATE" && sysctl -q -w net.ipv4.ip_forward=0 >/dev/null 2>&1
+	grep -q '^ipv6=0' "$FORWARD_STATE" && sysctl -q -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1
+	rm -f "$FORWARD_STATE"
+	return 0
+}
+
+pre_start() {
+	if [ ! -x "$BIN" ]; then
+		echo "openbox: sing-box binary not found at $BIN" >&2
+		return 1
+	fi
+	if [ ! -f "$CONF" ]; then
+		echo "openbox: config not found at $CONF" >&2
+		return 1
+	fi
+	[ -e /dev/net/tun ] || modprobe tun >/dev/null 2>&1
+	openbox_clean_stale_nft
+	openbox_load_modules
+	openbox_apply_nft
+	openbox_apply_mark_rule
+	openbox_enable_forward
+	return 0
+}
+
+# 停止后让系统回到"能正常上网"的状态:撤标记路由、删自己的 nft 表、关回转发。内核自己的 inet sing-box 表
+# 由它正常退出时删,被强杀留下的下次 pre-start 清
+post_stop() {
+	openbox_clear_mark_rule
+	command -v nft >/dev/null 2>&1 && nft delete table $NFT_TABLE >/dev/null 2>&1
+	openbox_restore_forward
+	return 0
+}
+
+# ---------- iKuai 本地进程管理（替代 systemctl） ----------
+
+core_running() {
+	pgrep -f 'bin/sing-box run' >/dev/null 2>&1
+}
+
+sup_running() {
+	[ -f "$SUP_PIDFILE" ] || return 1
+	_ob_pid=$(cat "$SUP_PIDFILE" 2>/dev/null)
+	[ -n "$_ob_pid" ] && kill -0 "$_ob_pid" 2>/dev/null
+}
+
+do_start() {
+	mkdir -p "$DATA" "$DATA/logs"
+	touch "$ENABLED_FLAG"
+	# 每次服务启动截断内核日志：面板按"最后一条 FATAL"判断本次崩溃原因，
+	# 追加式日志里的陈旧 FATAL 会误导它的降级/回滚判断
+	: > "$DATA/logs/core.log" 2>/dev/null
+	if ! sup_running; then
+		# 直接后台拉起（脚本内有 flock 单实例锁，重复调用安全）。
+		# 不用 start-stop-daemon -x：它带"已运行则不启动"检查，
+		# do_stop 后旧进程未死透时会误判拒绝启动
+		"$SUP" >/dev/null 2>&1 &
+	fi
+	# 等内核"第一次启动尝试"再返回（systemd Type=simple 语义：进程拉起才返回）。
+	# 崩溃循环里 sing-box 存活窗口不足 1 秒、按进程轮询必然漏判，
+	# 改看日志：守护循环每一次启动尝试都会写行，日志非空即说明内核拉起来过。
+	# 是否还活着由面板的验证循环判断；25 秒无任何动静算启动失败
+	_ob_i=0
+	while [ "$_ob_i" -lt 25 ]; do
+		core_running && return 0
+		[ -s "$DATA/logs/core.log" ] && return 0
+		sleep 1
+		_ob_i=$((_ob_i + 1))
+	done
+	return 1
+}
+
+do_stop() {
+	rm -f "$ENABLED_FLAG"
+	if [ -f "$SUP_PIDFILE" ]; then
+		kill "$(cat "$SUP_PIDFILE" 2>/dev/null)" 2>/dev/null
+		rm -f "$SUP_PIDFILE"
+	fi
+	pkill -f 'core-supervisor[.]sh' 2>/dev/null
+	pkill -f 'bin/sing-box run' 2>/dev/null
+	# 等守护循环与内核真正退出，避免随后的 do_start 与旧实例抢 flock
+	_ob_i=0
+	while [ "$_ob_i" -lt 15 ]; do
+		pgrep -f 'core-supervisor[.]sh' >/dev/null 2>&1 || core_running || break
+		sleep 1
+		_ob_i=$((_ob_i + 1))
+	done
+	pgrep -f 'core-supervisor[.]sh' >/dev/null 2>&1 && pkill -9 -f 'core-supervisor[.]sh' 2>/dev/null
+	core_running && pkill -9 -f 'bin/sing-box run' 2>/dev/null
+	post_stop
+	return 0
+}
+
+case "$1" in
+	pre-start) pre_start ;;
+	post-stop) post_stop ;;
+	start) do_start ;;
+	stop) do_stop ;;
+	restart) do_stop; do_start ;;
+	reload) do_stop; do_start ;;
+	enable|disable) exit 0 ;;
+	enabled) exit 0 ;;
+	running) core_running ;;
+	status)
+		if core_running; then
+			echo "running"
+			exit 0
+		fi
+		echo "inactive"
+		exit 3
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload|enable|disable|enabled|running|status}" >&2
+		exit 1
+		;;
+esac

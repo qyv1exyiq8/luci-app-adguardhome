@@ -1,0 +1,58 @@
+#!/bin/sh
+# Open-Box 面板服务控制脚本（iKuai 定制版）
+# 动作集合与官方 debian/bin/openbox-panel-ctl 一致，systemctl 调用换成本地进程管理。
+# 面板的启停由 cron 看门狗兜底；这里供面板自身（修改端口后自动重启）和命令行使用。
+ROOT=/opt/open-box
+RUN="$ROOT/ikuai/panel-run.sh"
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+panel_running() {
+	pgrep -f 'panel/server/index[.]mjs' >/dev/null 2>&1
+}
+
+do_start() {
+	panel_running && return 0
+	start-stop-daemon -S -b -x "$RUN" >/dev/null 2>&1
+	_i=0
+	while [ "$_i" -lt 20 ]; do
+		panel_running && return 0
+		sleep 1
+		_i=$((_i + 1))
+	done
+	panel_running
+}
+
+do_stop() {
+	pkill -f 'panel/server/index[.]mjs' 2>/dev/null
+	_i=0
+	while [ "$_i" -lt 10 ]; do
+		panel_running || return 0
+		sleep 1
+		_i=$((_i + 1))
+	done
+	pkill -9 -f 'panel/server/index[.]mjs' 2>/dev/null
+	if panel_running; then return 1; fi
+	return 0
+}
+
+case "$1" in
+	start) do_start ;;
+	stop) do_stop ;;
+	restart|reload) do_stop; do_start ;;
+	enable|disable) exit 0 ;;
+	enabled) exit 0 ;;
+	running) panel_running ;;
+	status)
+		if panel_running; then
+			echo "running"
+			exit 0
+		fi
+		echo "inactive"
+		exit 3
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload|enable|disable|enabled|running|status}" >&2
+		exit 1
+		;;
+esac

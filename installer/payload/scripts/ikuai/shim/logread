@@ -1,0 +1,20 @@
+#!/bin/sh
+# 给面板用的 logread 替身（iKuai 版）：iKuai 没有 journald，也没有 OpenWrt 的 logread。
+# 内核守护循环把 sing-box 输出按 syslog short 格式写进 data/logs/core.log，这里按同样接口读出。
+# 面板用法：logread -e <正则>（取内核最后一句 FATAL）、logread | grep ...（诊断包）
+PATTERN=""
+LINES=3000
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-e) PATTERN="$2"; shift 2 ;;
+		-l) LINES="$2"; shift 2 ;;
+		*) shift ;;
+	esac
+done
+LOG=/opt/open-box/data/logs/core.log
+[ -f "$LOG" ] || exit 0
+if [ -n "$PATTERN" ]; then
+	tail -n "$LINES" "$LOG" | grep -E -- "$PATTERN"
+else
+	tail -n "$LINES" "$LOG"
+fi
