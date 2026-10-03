@@ -59,10 +59,22 @@ C_HINT    = "#8888aa"  # 提示文字
 C_LOG     = "#0d0d1a"  # 日志背景
 C_LOGFG   = "#00ff88"  # 日志文字（终端绿）
 
-# 资源目录：PyInstaller 打包后在 sys._MEIPASS，开发时在脚本同级的 payload/
+# 资源目录：PyInstaller 在 sys._MEIPASS；Nuitka onefile 解压目录=主模块所在目录；
+# 开发态=脚本同级。逐个探测 payload/ 存在性，取第一个命中。
 def res_path(*parts):
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, "payload", *parts)
+    candidates = []
+    if hasattr(sys, "_MEIPASS"):
+        candidates.append(sys._MEIPASS)
+    try:
+        candidates.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:
+        pass
+    candidates.append(os.path.dirname(os.path.abspath(sys.argv[0] if sys.argv else sys.executable)))
+    candidates.append(os.path.dirname(os.path.abspath(sys.executable)))
+    for base in candidates:
+        if os.path.isdir(os.path.join(base, "payload")):
+            return os.path.join(base, "payload", *parts)
+    return os.path.join(candidates[0] if candidates else ".", "payload", *parts)
 
 
 class Installer:
@@ -271,6 +283,7 @@ class Installer:
             if sha.strip() != runtime_sha:
                 raise RuntimeError(f"runtime 包 SHA256 校验失败：{sha.strip()}")
             self.log("  runtime 包 SHA256 校验通过")
+        self.run("mkdir -p /etc/log/open-box/musl")
         self.upload(res_path("musl", "libc.so"), "/etc/log/open-box/musl/libc.so")
         self.run("mkdir -p /etc/log/open-box/musl && cd /tmp && mkdir -p rt && tar -xzf runtime.tgz -C rt "
                  "&& cp -r rt/node/* /etc/log/open-box/node/ "
@@ -307,9 +320,10 @@ class Installer:
                  f"&& printf '{PANEL_PORT}\\n' > /etc/log/open-box/data/panel-port")
         self.log("  控制脚本与看门狗脚本安装完成")
 
-        s(7, "写入开机自启（crontab 双保险）")
-        # 爱快 crond 读 /etc/crontabs/root，且会把 cron.d/* 周期性合并重建 root。
-        # 两处都写：cron.d 为爱快原生机制，root 追加防老版本不合并。重复行无害（看门狗幂等）。
+        s(7, "写入看门狗定时任务（当前周期兜底；重启后由固件钩子接管）")
+        # 爱快 crond 读 /etc/crontabs/root。此写入只保证当前启动周期内看门狗每分钟自愈；
+        # 重启后根文件系统重建会清空 crontab——持久自启已改由固件 patch-9 钩子
+        # （/etc/log/disk_user/openbox/install.sh → watchdog）承担，watchdog 运行时会自补 crontab。
         self.run("grep -q 'ikuai/watchdog.sh' /etc/crontabs/root 2>/dev/null || "
                  "echo '* * * * * /opt/open-box/ikuai/watchdog.sh >/dev/null 2>&1' >> /etc/crontabs/root")
         _c1, in_root = self.run("grep -c 'ikuai/watchdog.sh' /etc/crontabs/root 2>/dev/null; true", check=False)
@@ -317,10 +331,10 @@ class Installer:
         n_root = int((in_root.strip() or "0").split("\n")[-1] or 0)
         n_crond = int((in_crond.strip() or "0").split("\n")[-1] or 0)
         if n_root + n_crond == 0:
-            raise RuntimeError("crontab 写入失败：root 与 cron.d 均无看门狗条目")
-        self.log(f"  看门狗定时任务已写入（root 主表 {n_root} 条 + cron.d {n_crond} 条）")
-        self.log("  ⚠ 注意：爱快重启会重建根文件系统并清空 crontab，此写入仅当前周期有效！")
-        self.log("    永久方案见安装完成后的【开机自启】提示。")
+            self.log("  ⚠ 警告：crontab 写入失败（root 与 cron.d 均无看门狗条目）。")
+            self.log("    面板本次已启动，但当前周期内无分钟级自愈；重启后由固件钩子恢复。")
+        else:
+            self.log(f"  看门狗定时任务已写入（root 主表 {n_root} 条 + cron.d {n_crond} 条）")
 
         s(8, "启动面板并验证")
         self.run("/opt/open-box/ikuai/watchdog.sh")
@@ -640,6 +654,9 @@ class App(tk.Tk):
         try:
             while True:
                 m = self.q.get_nowait()
+                if m == "__DONE__":
+                    self._set_busy(False)
+                    continue
                 self.txt.insert("end", m + "\n")
                 self.txt.see("end")
         except queue.Empty:
@@ -664,9 +681,6 @@ class App(tk.Tk):
             finally:
                 self.q.put("__DONE__")
         threading.Thread(target=wrap, daemon=True).start()
-
-    def _drain_done_hook(self):
-        pass
 
     # ---- 输入 ----
     def _inputs(self):
@@ -752,27 +766,6 @@ class App(tk.Tk):
                     except Exception:
                         pass
         self._run_bg(fn)
-
-    # 完成标记处理
-    def _drain_done(self):
-        self._set_busy(False)
-
-
-# 覆写 _drain 处理完成标记
-_orig_drain = App._drain
-def _drain2(self):
-    try:
-        while True:
-            m = self.q.get_nowait()
-            if m == "__DONE__":
-                self._set_busy(False)
-                continue
-            self.txt.insert("end", m + "\n")
-            self.txt.see("end")
-    except queue.Empty:
-        pass
-    self.after(100, self._drain)
-App._drain = _drain2
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 #!/bin/sh
-# Open-Box 看门狗（iKuai 专用）v2 —— 自愈合版本
+# Open-Box 看门狗（iKuai 专用）v3 —— 自愈合版本
 # 由 crond 每分钟调用（推荐：爱快 Web「计划任务」填  sh /etc/log/open-box/ikuai/watchdog.sh）
+# 或由固件 patch-9 钩子经 /etc/log/disk_user/openbox/install.sh 调用（开机 0s/20s/60s 三次）。
 #
 # iKuai 重启后根文件系统会被重建，/opt、/lib 里的符号链接和 crontab 全部丢失，
 # 只有 /etc/log（sda5 持久分区）还在。本脚本每次运行先自愈环境，再检查服务：
