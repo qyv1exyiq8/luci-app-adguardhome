@@ -515,6 +515,8 @@ console.log('OK: autoRedirect ' + old + ' -> false');
                 self.log(f"  [警告] 设置面板密码失败 HTTP {e.code}，请首次访问时在浏览器设置")
 
     def _build_scripts_tgz(self):
+        """payload 脚本打包上传；Windows 检出可能带 CRLF，统一归一为 LF
+        （路由器 ash 解析 CRLF 脚本会报 /bin/sh^M: bad interpreter）。"""
         buf = io.BytesIO()
         sdir = res_path("scripts")
         with tarfile.open(fileobj=buf, mode="w:gz") as t:
@@ -522,7 +524,10 @@ console.log('OK: autoRedirect ' + old + ' -> false');
                 for fn in files:
                     full = os.path.join(root, fn)
                     arc = os.path.relpath(full, sdir).replace(os.sep, "/")
-                    t.add(full, arcname=arc)
+                    data = open(full, "rb").read().replace(b"\r\n", b"\n")
+                    info = t.gettarinfo(full, arcname=arc)
+                    info.size = len(data)
+                    t.addfile(info, io.BytesIO(data))
         return buf.getvalue()
 
 

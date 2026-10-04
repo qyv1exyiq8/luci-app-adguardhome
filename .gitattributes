@@ -5,3 +5,6 @@
 Makefile text eol=lf
 *.json text eol=lf
 *.js text eol=lf
+
+# 安装器 payload 脚本必须 LF（CRLF 会让路由器上 shebang 变成 /bin/sh^M）
+installer/payload/scripts/** text eol=lf
