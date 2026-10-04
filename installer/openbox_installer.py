@@ -12,13 +12,14 @@ import io
 import json
 import os
 import queue
-import socket
+import re
 import subprocess
 import sys
 import tarfile
 import threading
 import time
 import urllib.request
+import urllib.parse
 import urllib.error
 
 import tkinter as tk
@@ -28,36 +29,26 @@ import paramiko
 
 APP_TITLE = "Open-Box 爱快安装程序"
 OB_DIR = "/etc/log/open-box"
-OB_LINK = "/opt/open-box"
 PANEL_PORT = 3036
 
 # ---------- GitHub 云端下载 ----------
 GH_REPO = "liandu2024/Open-Box"
-GH_RELEASE_API = f"https://api.github.com/repos/{GH_REPO}/releases/latest"
-GH_API_MIRRORS = [
-    "https://api.kkgithub.com/repos/liandu2024/Open-Box/releases/latest",
-]
-# 下载镜像前缀（空串=直连），按顺序依次尝试
-GH_DL_MIRRORS = [
-    "",
-    "https://gh-proxy.com/",
-    "https://ghfast.top/",
-    "https://ghproxy.net/",
-]
+# github.com 网页不受 api.github.com 每小时 60 次限流约束，302 目标自带最新 tag
+GH_RELEASE_PAGE = f"https://github.com/{GH_REPO}/releases/latest"
 HTTP_HEADERS = {"User-Agent": "openbox-ikuai-installer/1.0"}
 
 # ---------- Deep Dark Pro 主题色 ----------
-C_BG      = "#1a1a2e"  # 窗口主背景
-C_HDR     = "#16213e"  # 头部背景
-C_PANEL   = "#16213e"  # 卡片背景
-C_ACCENT  = "#e94560"  # 强调红
-C_ACCENT2 = "#7ecfff"  # 强调青
-C_INPUT   = "#0d0d1a"  # 输入框背景
-C_BORDER  = "#2a2a4a"  # 边框
-C_TEXT    = "#eeeeee"  # 主文字
-C_HINT    = "#8888aa"  # 提示文字
-C_LOG     = "#0d0d1a"  # 日志背景
-C_LOGFG   = "#00ff88"  # 日志文字（终端绿）
+C_BG = "#1a1a2e"
+C_HDR = "#16213e"
+C_PANEL = "#16213e"
+C_ACCENT = "#e94560"
+C_ACCENT2 = "#7ecfff"
+C_INPUT = "#0d0d1a"
+C_BORDER = "#2a2a4a"
+C_TEXT = "#eeeeee"
+C_HINT = "#8888aa"
+C_LOG = "#0d0d1a"
+C_LOGFG = "#00ff88"
 
 # 资源目录：PyInstaller 在 sys._MEIPASS；Nuitka onefile 解压目录=主模块所在目录；
 # 开发态=脚本同级。逐个探测 payload/ 存在性，取第一个命中。
@@ -108,7 +99,7 @@ class Installer:
             raise RuntimeError(f"命令失败(exit {code}): {cmd}\n{text[-800:]}")
         return code, text
 
-    def upload(self, local, remote, size_mb_warn=1.0):
+    def upload(self, local, remote):
         """爱快无 sftp-server：用 cat 管道推文件，带进度"""
         total = os.path.getsize(local)
         self.log(f"  上传 {os.path.basename(local)} ({total/1048576:.1f} MB) → {remote}")
@@ -136,12 +127,7 @@ class Installer:
     def step(self, n, title):
         self.log(f"\n== 第 {n} 步：{title} ==")
 
-    # ---------- 云端检测 / 加速下载 ----------
-    def _http_get_json(self, url, timeout=20):
-        req = urllib.request.Request(url, headers=HTTP_HEADERS)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
-
+    # ---------- 云端检测 / 下载 ----------
     def _sha256_file(self, path):
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -149,87 +135,108 @@ class Installer:
                 h.update(chunk)
         return h.hexdigest()
 
+    def _asset_names(self, tag):
+        return [f"open-box-{tag}-linux-x64.tar.gz",
+                f"open-box-{tag}-linux-x64-runtime.tar.gz"]
+
+    def _fetch_sha256(self, sha_url):
+        """直连拉取 <资产>.sha256 校验值，失败返回空串（只影响校验强度，不阻塞安装）。"""
+        try:
+            req = urllib.request.Request(sha_url, headers=HTTP_HEADERS)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.read().decode("utf-8").split()[0].strip().lower()
+        except Exception:
+            return ""
+
+    def _remote_size(self, url):
+        """HEAD 直连探测资产大小，失败返回 0=未知。"""
+        try:
+            req = urllib.request.Request(url, headers=HTTP_HEADERS, method="HEAD")
+            with urllib.request.urlopen(req, timeout=20) as r:
+                if "text/html" in r.headers.get("Content-Type", ""):
+                    return 0
+                return int(r.headers.get("Content-Length", 0))
+        except Exception:
+            return 0
+
     def cloud_latest(self):
-        """查询 GitHub 最新 release，返回 (tag, {资产名: (大小, sha256)})。"""
-        errs, data = [], None
-        for api in [GH_RELEASE_API] + GH_API_MIRRORS:
-            try:
-                data = self._http_get_json(api)
-                self.log(f"  版本探测：{api.split('/')[2]} OK")
-                break
-            except Exception as e:
-                errs.append(f"{api}: {e}")
-        if data is None:
-            raise RuntimeError("GitHub 版本检测失败：\n" + "\n".join(errs))
-        tag = data.get("tag_name", "")
-        assets = {a.get("name"): a for a in data.get("assets", [])}
+        """免 API 直连探测最新 release，返回 (tag, {资产名: (大小, sha256)})。"""
+        errs, tag = [], ""
+        try:
+            req = urllib.request.Request(GH_RELEASE_PAGE, headers=HTTP_HEADERS)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                final_url = r.geturl()
+                body = r.read(262144).decode("utf-8", "replace")
+            mm = (re.search(r"/releases/tag/([^/?#\"]+)", final_url)
+                  or re.search(r"/releases/tag/([^/?#\"']+)", body))
+            if mm:
+                tag = urllib.parse.unquote(mm.group(1))
+                self.log(f"  版本探测（github.com 直连）→ {tag}")
+            else:
+                errs.append("响应中未找到 tag")
+        except Exception as e:
+            errs.append(str(e))
+        if not tag:
+            raise RuntimeError(
+                "GitHub 版本检测失败（直连不可用，请检查网络）:\n" + "\n".join(errs))
         result = {}
-        for name in (f"open-box-{tag}-linux-x64.tar.gz", f"open-box-{tag}-linux-x64-runtime.tar.gz"):
-            if name not in assets:  # 兼容无版本前缀的别名资产
-                alias = name.replace(f"-{tag}", "", 1)
-                if alias in assets:
-                    name = alias
-            info = assets.get(name)
-            if not info:
-                raise RuntimeError(f"release {tag} 中找不到资产 {name}")
-            size = int(info.get("size", 0))
-            sha256 = ""
-            sha_url = assets.get(name + ".sha256", {}).get("browser_download_url", "")
-            if sha_url:
-                for m in GH_DL_MIRRORS:
-                    try:
-                        req = urllib.request.Request(m + sha_url, headers=HTTP_HEADERS)
-                        with urllib.request.urlopen(req, timeout=20) as r:
-                            sha256 = r.read().decode("utf-8").split()[0].strip().lower()
-                        if sha256:
-                            break
-                    except Exception:
-                        continue
-            result[name] = (size, sha256)
+        for name in self._asset_names(tag):
+            durl = f"https://github.com/{GH_REPO}/releases/download/{tag}/{name}"
+            size = self._remote_size(durl)
+            sha = self._fetch_sha256(durl + ".sha256")
+            result[name] = (size, sha)
+            size_mb = "{:.1f} MB".format(size / 1048576) if size else "大小未知"
+            extra = "，校验值就绪" if sha else "，无校验值"
+            self.log(f"  资产 {name}（{size_mb}{extra}）")
         return tag, result
 
     def cloud_download(self, tag, name, size, sha256, dest_dir):
-        """多镜像依次尝试下载（带进度与缓存），完成后校验大小+SHA256。"""
+        """单条直连下载（带进度与缓存），SHA256 优先校验；大小仅在无校验值时硬校验。"""
         os.makedirs(dest_dir, exist_ok=True)
         dest = os.path.join(dest_dir, name)
-        if os.path.exists(dest) and os.path.getsize(dest) == size:
-            if not sha256 or self._sha256_file(dest) == sha256:
+        if os.path.exists(dest):
+            ok = ((not size or os.path.getsize(dest) == size)
+                  and (not sha256 or self._sha256_file(dest) == sha256))
+            if ok:
                 self.log(f"  本地缓存已是最新（{name}），跳过重下")
                 return dest
             os.unlink(dest)
-        base = f"https://github.com/{GH_REPO}/releases/download/{tag}/{name}"
-        last_err = None
-        for m in GH_DL_MIRRORS:
-            url = m + base
-            try:
-                self.log(f"  下载 {name}（{size / 1048576:.0f} MB），via {m or '直连'} ...")
-                req = urllib.request.Request(url, headers=HTTP_HEADERS)
-                t0, got, mark = time.time(), 0, -10
-                with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as f:
-                    while True:
-                        chunk = r.read(1048576)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        got += len(chunk)
-                        if size:
-                            pct = got * 100 // size
-                            if pct >= mark + 10:
-                                mark = pct - pct % 10
-                                spd = got / 1048576 / max(time.time() - t0, 0.1)
-                                self.log(f"    {mark}%  ({got / 1048576:.0f}/{size / 1048576:.0f} MB, {spd:.1f} MB/s)")
-                if size and os.path.getsize(dest) != size:
-                    raise RuntimeError(f"文件大小不符 {os.path.getsize(dest)} != {size}")
-                if sha256 and self._sha256_file(dest) != sha256:
-                    raise RuntimeError("SHA256 与官方发布值不符")
-                self.log(f"  下载完成、校验通过，用时 {time.time() - t0:.0f}s")
-                return dest
-            except Exception as e:
-                last_err = e
-                self.log(f"  [提示] {m or '直连'} 失败：{e}，换下一镜像...")
-                if os.path.exists(dest):
-                    os.unlink(dest)
-        raise RuntimeError(f"所有镜像均下载失败：{last_err}")
+        url = f"https://github.com/{GH_REPO}/releases/download/{tag}/{name}"
+        size_mb = "{:.1f} MB".format(size / 1048576) if size else "大小未知"
+        self.log(f"  下载 {name}（{size_mb}），直连 ...")
+        t0, got, mark = time.time(), 0, 0
+        try:
+            req = urllib.request.Request(url, headers=HTTP_HEADERS)
+            with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as f:
+                while True:
+                    chunk = r.read(1048576)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if size:
+                        pct = got * 100 // size
+                        if pct >= mark + 10:
+                            mark = pct - pct % 10
+                            spd = got / 1048576 / max(time.time() - t0, 0.1)
+                            self.log(f"    {mark}%  ({got / 1048576:.0f}/{size / 1048576:.0f} MB, {spd:.1f} MB/s)")
+                    elif got - mark >= 20971520:
+                        mark = got
+                        spd = got / 1048576 / max(time.time() - t0, 0.1)
+                        self.log(f"    已下载 {got / 1048576:.0f} MB ({spd:.1f} MB/s)")
+        except Exception as e:
+            if os.path.exists(dest):
+                os.unlink(dest)
+            raise RuntimeError(f"直连下载失败：{e}")
+        if sha256:
+            if self._sha256_file(dest) != sha256:
+                os.unlink(dest)
+                raise RuntimeError("SHA256 与官方发布值不符")
+        elif size and os.path.getsize(dest) != size:
+            os.unlink(dest)
+            raise RuntimeError(f"文件大小不符 {os.path.getsize(dest)} != {size}")
+        self.log(f"  下载完成、校验通过，用时 {time.time() - t0:.0f}s")
+        return dest
 
     # ---------- 安装主流程 ----------
     def install(self, host, port, user, password, panel_password, dest_dir):
@@ -242,7 +249,8 @@ class Installer:
         paths = {}
         for name, (size, sha256) in assets.items():
             label = "主安装包" if "runtime" not in name else "Node 运行时"
-            self.log(f"  组件[{label}] {name}（{size / 1048576:.0f} MB）")
+            size_mb = "{:.1f} MB".format(size / 1048576) if size else "大小未知"
+            self.log(f"  组件[{label}] {name}（{size_mb}）")
             paths[name] = self.cloud_download(tag, name, size, sha256, dest_dir)
         bundle_name = next(n for n in paths if "runtime" not in n)
         runtime_name = next(n for n in paths if "runtime" in n)
@@ -339,10 +347,10 @@ class Installer:
         s(8, "启动面板并验证")
         self.run("/opt/open-box/ikuai/watchdog.sh")
         ok = False
-        for i in range(15):
+        for _ in range(15):
             time.sleep(2)
-            code, http = self.run("curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3036/ 2>/dev/null",
-                                  check=False)
+            _c, http = self.run("curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3036/ 2>/dev/null",
+                                check=False)
             if http.strip() == "200":
                 ok = True
                 break
@@ -428,7 +436,6 @@ console.log('OK: autoRedirect ' + old + ' -> false');
         self.step(1, "SSH 连接")
         self.connect(host, port, user, password)
 
-        # 检查 open-box 是否已安装
         code, _ = self.run(f"ls {OB_DIR}/meta.json 2>/dev/null", check=False)
         if code != 0:
             raise RuntimeError(
@@ -453,13 +460,12 @@ console.log('OK: autoRedirect ' + old + ' -> false');
             # restart 可能返回非零但实际成功了，继续验证
             self.log("  [提示] restart 返回非零，继续验证...")
 
-        # 等待内核启动
         self.log("  等待内核启动...")
         time.sleep(5)
 
         self.step(4, "验证内核状态")
         for attempt in range(6):
-            code, status_out = self.run(
+            _c, status_out = self.run(
                 "/opt/open-box/debian/bin/openbox-ctl status 2>&1",
                 check=False,
             )
@@ -470,7 +476,7 @@ console.log('OK: autoRedirect ' + old + ' -> false');
             time.sleep(3)
         else:
             # 最后一次检查进程
-            code, ps_out = self.run(
+            _c, ps_out = self.run(
                 "ps w | grep 'bin/sing-box' | grep -v grep",
                 check=False,
             )
@@ -479,8 +485,7 @@ console.log('OK: autoRedirect ' + old + ' -> false');
             else:
                 raise RuntimeError("内核启动失败，请查看面板日志。")
 
-        # 显示最近内核日志
-        code, core_log = self.run(
+        _c, core_log = self.run(
             "tail -3 /opt/open-box/data/logs/core.log 2>/dev/null",
             check=False,
         )
@@ -527,7 +532,6 @@ class App(tk.Tk):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("760x600")
-        # 窗口图标（打包后从 _MEIPASS 读取）
         try:
             self.iconbitmap(os.path.join(
                 getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))),
@@ -751,7 +755,7 @@ class App(tk.Tk):
 
     def do_fix_core(self):
         def fn():
-            host, port, user, pw, panel = self._inputs()
+            host, port, user, pw, _panel = self._inputs()
             if not pw:
                 raise ValueError("请填写 SSH 密码")
             self.log(f"开始修复 Open-Box 内核（{host}）...")
